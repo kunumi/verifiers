@@ -1,8 +1,8 @@
 import json
 from typing import List, Dict, Callable
 
-from ..parsers import Parser, XMLParser
-from .rubric import Rubric
+from verifiers.parsers import Parser, XMLParser
+from verifiers.rubrics import Rubric
 
 class ToolRubric(Rubric):
     def __init__(self,

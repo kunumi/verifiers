@@ -234,6 +234,12 @@ class GRPOConfig(TrainingArguments):
             "lower-bound specified in argument `epsilon`. Paper DAPO recommends `0.28`."
         },
     )
+    rollout_filter_ratio: Optional[float] = field(
+        default=1,
+        metadata={
+            "help": "The percentage of rollouts to keep based on variance of samples. Default value is 1 (keep all rollouts)"
+        }
+    )
     scale_rewards: bool = field(
         default=True,
         metadata={

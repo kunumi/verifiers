@@ -1,8 +1,8 @@
 import json
 from typing import List, Any
 
-from ..parsers.smola_parser import SmolaParser
-from .tool_rubric import ToolRubric
+from verifiers.parsers.smola_parser import SmolaParser
+from verifiers.rubrics.tool_rubric import ToolRubric
 
 class SmolaToolRubric(ToolRubric):
     def __init__(self,

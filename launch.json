@@ -1,0 +1,9 @@
+{
+    "name": "train",
+    "type": "python",
+    "request": "launch",
+    "module": "accelerate.commands.launch",
+    "args": ["verifiers/examples/wordle.py", "--config-file configs/zero3.yaml", "--num-processes 1"], 
+    "console": "integratedTerminal",
+    "env": {"CUDA_VISIBLE_DEVICES": "1"}
+  }

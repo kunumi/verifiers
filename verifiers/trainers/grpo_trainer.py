@@ -4,7 +4,7 @@ import logging
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from typing import Optional, Union, Any, List, Dict, Tuple
-
+import traceback 
 import datasets
 import openai
 import torch
@@ -29,13 +29,13 @@ from trl.trainer.utils import (
 import wandb
 import numpy as np
 
-from ..envs import Environment
-from ..inference import VLLMClient
-from ..trainers.grpo_config import GRPOConfig
-from ..trainers.async_batch_generator import AsyncBatchGenerator, BatchRequest
-from ..trainers.async_dataloader_wrapper import AsyncDataLoaderWrapper
-from ..utils.logging_utils import print_prompt_completions_sample   
-from ..utils.trainer_utils import RepeatSampler
+from verifiers import Environment
+from verifiers.inference import VLLMClient
+from verifiers.trainers.grpo_config import GRPOConfig
+from verifiers.trainers.async_batch_generator import AsyncBatchGenerator, BatchRequest
+from verifiers.trainers.async_dataloader_wrapper import AsyncDataLoaderWrapper
+from verifiers.utils.logging_utils import print_prompt_completions_sample   
+from verifiers.utils.trainer_utils import RepeatSampler
 
 # torch.nanstd doesn't exist, so we define it here
 def nanstd(tensor: torch.Tensor) -> torch.Tensor:
@@ -179,6 +179,7 @@ class GRPOTrainer(Trainer):
         self.scale_rewards = args.scale_rewards
         self.mask_truncated_completions = args.mask_truncated_completions
         self.delta = args.delta
+        self.rollout_filter_ratio = args.rollout_filter_ratio
 
         # Reference model parameters
         self.beta = args.beta
@@ -604,202 +605,250 @@ class GRPOTrainer(Trainer):
         2. On first calls, prime by submitting num_batches_ahead batches before retrieving any
         3. On subsequent calls, submit new batches to maintain the pipeline
         """
-        # Ensure all processes are synchronized at the start
-        self.accelerator.wait_for_everyone()
-        
-        # inputs = list of dicts for all gradient accumulation steps 
-        generate_every = self.gradient_accumulation_steps * self.num_iterations
- 
-        # Check if we need to generate new completions
-        if self._step % generate_every == 0 or self._buffered_inputs is None:
-            # Update weights to vLLM if needed
-            if self.state.global_step > self._last_loaded_step:
-                self.logger.info(f"Syncing weights to vLLM at step {self.state.global_step}")
-                self._move_model_to_vllm()
-                self._last_loaded_step = self.state.global_step
-            
-            # Start async generator if not started
-            if not self._async_started and self.accelerator.is_main_process:
-                self.async_generator.start()
-            self._async_started = True
+        try:
+            # Ensure all processes are synchronized at the start
             self.accelerator.wait_for_everyone()
             
-            # Calculate which batch we need for this step
-            batch_id_to_retrieve = self._step // generate_every
-            
-            # Calculate the target: we want to always be num_batches_ahead batches ahead
-            # This means we should have submitted up to batch_id_to_retrieve + num_batches_ahead
-            target_batch_id = batch_id_to_retrieve + self.async_generator.num_batches_ahead
-            
-            # Submit any missing batches to maintain the pipeline
-            # On first call, this submits batches 0 through num_batches_ahead
-            # On subsequent calls, this submits new batches to stay ahead
-            batches_submitted = 0
-            
-            for batch_id in range(self._next_batch_id, target_batch_id + 1):
-                batch_offset = batch_id - batch_id_to_retrieve
-                all_prompts, all_answers, all_tasks = self._gather_batch_data(batch_offset)
+            # inputs = list of dicts for all gradient accumulation steps 
+            generate_every = self.gradient_accumulation_steps * self.num_iterations
+    
+            # Check if we need to generate new completions
+            if self._step % generate_every == 0 or self._buffered_inputs is None:
+                # Update weights to vLLM if needed
+                if self.state.global_step > self._last_loaded_step:
+                    self.logger.info(f"Syncing weights to vLLM at step {self.state.global_step}")
+                    self._move_model_to_vllm()
+                    self._last_loaded_step = self.state.global_step
                 
-                local_batch_size = len(all_prompts) // self.accelerator.num_processes
+                # Start async generator if not started
+                if not self._async_started and self.accelerator.is_main_process:
+                    self.async_generator.start()
+                self._async_started = True
+                self.accelerator.wait_for_everyone()
                 
-                # Submit batch (main process only)
+                # Calculate which batch we need for this step
+                batch_id_to_retrieve = self._step // generate_every
+                
+                # Calculate the target: we want to always be num_batches_ahead batches ahead
+                # This means we should have submitted up to batch_id_to_retrieve + num_batches_ahead
+                target_batch_id = batch_id_to_retrieve + self.async_generator.num_batches_ahead
+                
+                # Submit any missing batches to maintain the pipeline
+                # On first call, this submits batches 0 through num_batches_ahead
+                # On subsequent calls, this submits new batches to stay ahead
+                batches_submitted = 0
+                
+                for batch_id in range(self._next_batch_id, target_batch_id + 1):
+                    batch_offset = batch_id - batch_id_to_retrieve
+                    all_prompts, all_answers, all_tasks = self._gather_batch_data(batch_offset)
+                    
+                    local_batch_size = len(all_prompts) // self.accelerator.num_processes
+                    
+                    # Submit batch (main process only)
+                    if self.accelerator.is_main_process:
+                        request = BatchRequest(
+                            batch_id=batch_id,
+                            env_inputs={'prompt': all_prompts, 'answer': all_answers, 'task': all_tasks},
+                            processing_class=self.processing_class,
+                            mask_env_responses=self.mask_env_responses,
+                            max_completion_length=self.max_completion_length,
+                            mask_truncated_completions=self.mask_truncated_completions,
+                            max_concurrent=self.max_concurrent,
+                            device=self.accelerator.device,
+                            accelerator=self.accelerator,
+                            process_index=self.accelerator.process_index,
+                            num_processes=self.accelerator.num_processes,
+                            local_batch_size=local_batch_size,
+                        )
+                        self.async_generator.submit_batch(request)
+                        self.logger.info(f"Submitted batch {batch_id} with {len(all_prompts)} prompts (num processes: {self.accelerator.num_processes})")
+                        batches_submitted += 1
+                    self.accelerator.wait_for_everyone()
+
+                # Update next batch id
                 if self.accelerator.is_main_process:
-                    request = BatchRequest(
-                        batch_id=batch_id,
-                        env_inputs={'prompt': all_prompts, 'answer': all_answers, 'task': all_tasks},
-                        processing_class=self.processing_class,
-                        mask_env_responses=self.mask_env_responses,
-                        max_completion_length=self.max_completion_length,
-                        mask_truncated_completions=self.mask_truncated_completions,
-                        max_concurrent=self.max_concurrent,
-                        device=self.accelerator.device,
-                        accelerator=self.accelerator,
-                        process_index=self.accelerator.process_index,
-                        num_processes=self.accelerator.num_processes,
-                        local_batch_size=local_batch_size,
-                    )
-                    self.async_generator.submit_batch(request)
-                    self.logger.info(f"Submitted batch {batch_id} with {len(all_prompts)} prompts (num processes: {self.accelerator.num_processes})")
-                    batches_submitted += 1
+                    self._next_batch_id = self._next_batch_id + batches_submitted
+                    if batches_submitted > 0:
+                        self.logger.info(f"Submitted {batches_submitted} batches, next_batch_id now {self._next_batch_id}")
+                self.accelerator.wait_for_everyone()
+                # Synchronize next_batch_id across all processes
+                next_batch_id_list = [self._next_batch_id if self.accelerator.is_main_process else 0]
+                broadcast_object_list(next_batch_id_list, from_process=0)
+                self._next_batch_id = next_batch_id_list[0]
+                self.accelerator.wait_for_everyone()
+                
+                # Now retrieve the batch we need for this step
+                if self.accelerator.is_main_process:
+                    self.logger.info(f"Retrieving batch {batch_id_to_retrieve} for processing")
+                    
+                    # Get batch result
+                    batch_result = self.async_generator.get_batch(batch_id_to_retrieve) 
+                    processed_results = batch_result.processed_results
+                    
+                    # Package raw data for broadcast (not tensors yet)
+                    broadcast_data = {
+                        'prompt_ids': processed_results['prompt_ids'],
+                        'prompt_mask': processed_results['prompt_mask'],
+                        'completion_ids': processed_results['completion_ids'],
+                        'completion_mask': processed_results['completion_mask'],
+                        'rewards': processed_results['rewards'],
+                        'all_reward_dict': batch_result.all_reward_dict if hasattr(batch_result, 'all_reward_dict') else {'reward': processed_results['rewards']},
+                        'completions': batch_result.completions if hasattr(batch_result, 'completions') else [],
+                        'prompts': batch_result.prompts if hasattr(batch_result, 'prompts') else [],
+                    }
+                else:
+                    broadcast_data = None
                 self.accelerator.wait_for_everyone()
 
-            # Update next batch id
-            if self.accelerator.is_main_process:
-                self._next_batch_id = self._next_batch_id + batches_submitted
-                if batches_submitted > 0:
-                    self.logger.info(f"Submitted {batches_submitted} batches, next_batch_id now {self._next_batch_id}")
-            self.accelerator.wait_for_everyone()
-            # Synchronize next_batch_id across all processes
-            next_batch_id_list = [self._next_batch_id if self.accelerator.is_main_process else 0]
-            broadcast_object_list(next_batch_id_list, from_process=0)
-            self._next_batch_id = next_batch_id_list[0]
-            self.accelerator.wait_for_everyone()
             
-            # Now retrieve the batch we need for this step
-            if self.accelerator.is_main_process:
-                self.logger.info(f"Retrieving batch {batch_id_to_retrieve} for processing")
+                # Broadcast processed data
+                broadcast_list = [broadcast_data]
+                broadcast_object_list(broadcast_list, from_process=0)
+                broadcast_data = broadcast_list[0]
+                self.accelerator.wait_for_everyone()
                 
-                # Get batch result
-                batch_result = self.async_generator.get_batch(batch_id_to_retrieve) 
-                processed_results = batch_result.processed_results
                 
-                # Package raw data for broadcast (not tensors yet)
-                broadcast_data = {
-                    'prompt_ids': processed_results['prompt_ids'],
-                    'prompt_mask': processed_results['prompt_mask'],
-                    'completion_ids': processed_results['completion_ids'],
-                    'completion_mask': processed_results['completion_mask'],
-                    'rewards': processed_results['rewards'],
-                    'all_reward_dict': batch_result.all_reward_dict if hasattr(batch_result, 'all_reward_dict') else {'reward': processed_results['rewards']},
-                    'completions': batch_result.completions if hasattr(batch_result, 'completions') else [],
-                    'prompts': batch_result.prompts if hasattr(batch_result, 'prompts') else [],
-                }
-            else:
-                broadcast_data = None
-            self.accelerator.wait_for_everyone()
-            
-            # Broadcast processed data
-            broadcast_list = [broadcast_data]
-            broadcast_object_list(broadcast_list, from_process=0)
-            broadcast_data = broadcast_list[0]
-            self.accelerator.wait_for_everyone()
-            
-            # Each process takes its slice
-            process_slice = slice(
-                self.accelerator.process_index * len(inputs),
-                (self.accelerator.process_index + 1) * len(inputs),
-            )
-            
-            # Create rewards tensor and compute advantages using full batch
-            assert broadcast_data is not None  # After broadcast, all processes have data
-            all_rewards = torch.tensor(broadcast_data['rewards'], device=self.accelerator.device)
-            all_advantages = self._compute_advantages(all_rewards)
-            
-            # Now create tensors only for this process's slice
-            prompt_ids_list = []
-            prompt_mask_list = []
-            completion_ids_list = []
-            completion_mask_list = []
-            
-            for i in range(process_slice.start, process_slice.stop):
-                prompt_ids_list.append(torch.tensor(broadcast_data['prompt_ids'][i], device=self.accelerator.device))
-                prompt_mask_list.append(torch.tensor(broadcast_data['prompt_mask'][i], device=self.accelerator.device))
-                completion_ids_list.append(torch.tensor(broadcast_data['completion_ids'][i], device=self.accelerator.device))
-                completion_mask_list.append(torch.tensor(broadcast_data['completion_mask'][i], device=self.accelerator.device))
+                # Create rewards tensor and compute advantages using full batch
+                assert broadcast_data is not None  # After broadcast, all processes have data
 
-            # Pad sequences
-            prompt_ids = pad(prompt_ids_list, padding_value=self.processing_class.pad_token_id, padding_side='left') # type: ignore
-            prompt_mask = pad(prompt_mask_list, padding_side='left') # type: ignore
-            completion_ids = pad(completion_ids_list, padding_value=self.processing_class.pad_token_id, padding_side='right') # type: ignore
-            completion_mask = pad(completion_mask_list)
+                # # Filtragem de rollouts
+                rewards_tensor = torch.tensor(broadcast_data['rewards'], device=self.accelerator.device)
+                num_groups = rewards_tensor.numel() // self.num_generations
+                top_n = min(self.rollout_filter_ratio*num_groups, num_groups)
+
+                if top_n < num_groups:
+                    group_stds = rewards_tensor.view(num_groups, self.num_generations).std(dim=1)
+                    _, top_idx = torch.topk(group_stds, top_n)
+                    keep_mask = torch.zeros(num_groups, dtype=torch.bool, device=rewards_tensor.device)
+                    keep_mask[top_idx] = True
+                    keep_mask = keep_mask.repeat_interleave(self.num_generations)
+                    keep_mask_cpu = keep_mask.cpu().tolist()
+
+                    def _select(lst, mask): return [x for x, keep in zip(lst, mask) if keep]
+
+                    for key in ['prompt_ids', 'prompt_mask', 'completion_ids', 'completion_mask', 'rewards']:
+                        broadcast_data[key] = _select(broadcast_data[key], keep_mask_cpu)
+                    if broadcast_data['prompts']:
+                        broadcast_data['prompts'] = _select(broadcast_data['prompts'], keep_mask_cpu)
+                    if broadcast_data['completions']:
+                        broadcast_data['completions'] = _select(broadcast_data['completions'], keep_mask_cpu)
             
-            # Truncate if needed
-            if self.max_prompt_length is not None and prompt_ids.size(1) > self.max_prompt_length:
-                prompt_ids = prompt_ids[:, -self.max_prompt_length:]
-                prompt_mask = prompt_mask[:, -self.max_prompt_length:]
-            
-            if self.max_completion_length is not None and completion_ids.size(1) > self.max_completion_length:
-                completion_ids = completion_ids[:, :self.max_completion_length]
-                completion_mask = completion_mask[:, :self.max_completion_length]
-            
-            # Take this process's slice of advantages
-            advantages = all_advantages[process_slice]
-            
-            # Log metrics on main process only
-            if self.accelerator.is_main_process:
-                self._log_reward_metrics_primary(
-                    mode="train",
-                    all_reward_dict=broadcast_data['all_reward_dict'],
-                    all_rewards=all_rewards,
-                    generation_batch_size=len(all_rewards)
-                )
+
+                batch_size = len(broadcast_data['prompt_ids'])
+
+                # distribute examples as evenly as possible
+                per_proc = (batch_size + self.accelerator.num_processes - 1) // self.accelerator.num_processes
+                start    = self.accelerator.process_index * per_proc
+                end      = min(start + per_proc, batch_size)
+
+                process_slice = slice(start, end)
+                print("inputs", len(inputs))
                 
-                self._log_textual_data_primary(
-                    all_prompts=broadcast_data['prompts'],
-                    all_completions=broadcast_data['completions'],
-                    all_reward_dict=broadcast_data['all_reward_dict']
-                )
+
+                all_rewards = torch.tensor(broadcast_data['rewards'], device=self.accelerator.device)
+                all_advantages = self._compute_advantages(all_rewards)
                 
-                # Log completion metrics using full batch data on CPU to save memory
-                self._log_completion_metrics_primary(
-                    mode="train",
-                    all_completion_mask=broadcast_data['completion_mask'],
-                    all_completion_ids=broadcast_data['completion_ids'], 
-                    all_prompt_mask=broadcast_data['prompt_mask']
-                )
-            
-            # Concatenate all data for shuffling
-            full_batch = {
-                "prompt_ids": prompt_ids,
-                "prompt_mask": prompt_mask,
-                "completion_ids": completion_ids,
-                "completion_mask": completion_mask,
-                "old_per_token_logps": None,
-                "advantages": advantages,
-            }
-            
-            # Shuffle and split for gradient accumulation
-            full_batch = shuffle_tensor_dict(full_batch)
-            self._buffered_inputs = split_tensor_dict(full_batch, self.gradient_accumulation_steps)
+                # Now create tensors only for this process's slice
+                prompt_ids_list = []
+                prompt_mask_list = []
+                completion_ids_list = []
+                completion_mask_list = []
+
+                
+                for i in range(process_slice.start, process_slice.stop):
+                    prompt_ids_list.append(torch.tensor(broadcast_data['prompt_ids'][i], device=self.accelerator.device))
+                    prompt_mask_list.append(torch.tensor(broadcast_data['prompt_mask'][i], device=self.accelerator.device))
+                    completion_ids_list.append(torch.tensor(broadcast_data['completion_ids'][i], device=self.accelerator.device))
+                    completion_mask_list.append(torch.tensor(broadcast_data['completion_mask'][i], device=self.accelerator.device))
+                    # rewards_list.append(torch.tensor(broadcast_data['rewards'][i], device=self.accelerator.device))
+
+                # Pad sequences
+                prompt_ids = pad(prompt_ids_list, padding_value=self.processing_class.pad_token_id, padding_side='left') # type: ignore
+                prompt_mask = pad(prompt_mask_list, padding_side='left') # type: ignore
+                completion_ids = pad(completion_ids_list, padding_value=self.processing_class.pad_token_id, padding_side='right') # type: ignore
+                completion_mask = pad(completion_mask_list)
+                # rewards_list = pad(rewards_list)
+                
+                # Truncate if needed
+                if self.max_prompt_length is not None and prompt_ids.size(1) > self.max_prompt_length:
+                    prompt_ids = prompt_ids[:, -self.max_prompt_length:]
+                    prompt_mask = prompt_mask[:, -self.max_prompt_length:]
+                
+                if self.max_completion_length is not None and completion_ids.size(1) > self.max_completion_length:
+                    completion_ids = completion_ids[:, :self.max_completion_length]
+                    completion_mask = completion_mask[:, :self.max_completion_length]
+                
+                # Take this process's slice of advantages
+                advantages = all_advantages[process_slice]
+                
+                # Log metrics on main process only
+                if self.accelerator.is_main_process:
+                    self._log_reward_metrics_primary(
+                        mode="train",
+                        all_reward_dict=broadcast_data['all_reward_dict'],
+                        all_rewards=all_rewards,
+                        generation_batch_size=len(all_rewards)
+                    )
+                    
+                    self._log_textual_data_primary(
+                        all_prompts=broadcast_data['prompts'],
+                        all_completions=broadcast_data['completions'],
+                        all_reward_dict=broadcast_data['all_reward_dict']
+                    )
+                    
+                    # Log completion metrics using full batch data on CPU to save memory
+                    self._log_completion_metrics_primary(
+                        mode="train",
+                        all_completion_mask=broadcast_data['completion_mask'],
+                        all_completion_ids=broadcast_data['completion_ids'], 
+                        all_prompt_mask=broadcast_data['prompt_mask']
+                    )
+                
+                # Concatenate all data for shuffling
+                full_batch = {
+                    "prompt_ids": prompt_ids,
+                    "prompt_mask": prompt_mask,
+                    "completion_ids": completion_ids,
+                    "completion_mask": completion_mask,
+                    "old_per_token_logps": None,
+                    "advantages": advantages,
+                    "rewards": torch.tensor(broadcast_data['rewards'][process_slice])
+                }
+                
+                # Shuffle and split for gradient accumulation
+                full_batch = shuffle_tensor_dict(full_batch)
+                self._buffered_inputs = split_tensor_dict(full_batch, self.gradient_accumulation_steps)
+                self.accelerator.wait_for_everyone()
+            # Return appropriate slice from buffer
+            result = self._buffered_inputs[self._step % self.gradient_accumulation_steps]
+            self._step += 1
             self.accelerator.wait_for_everyone()
-        # Return appropriate slice from buffer
-        result = self._buffered_inputs[self._step % self.gradient_accumulation_steps]
-        self._step += 1
-        self.accelerator.wait_for_everyone()
-        return result
+            print("result", result)
+            return result
+        except Exception:
+            traceback.print_exc()
+            raise
 
     def _compute_advantages(
         self,
         rewards: torch.Tensor,
     ) -> torch.Tensor:
         """Compute advantages from rewards with normalization using full batch statistics."""
+
+        print(rewards)
+
         # Always use full batch statistics
         mean_grouped = rewards.view(-1, self.num_generations).mean(dim=1)
-        std_grouped = rewards.view(-1, self.num_generations).std(dim=1)
+        std_grouped = rewards.view(-1, self.num_generations).std(dim=1) # tamanho vai ser o numero de grupos (?), ai posso selecionar as que eu quero
+
+        print("mean", mean_grouped)
         
         # Normalize the rewards to compute advantages
         mean_grouped = mean_grouped.repeat_interleave(self.num_generations, dim=0)
         std_grouped = std_grouped.repeat_interleave(self.num_generations, dim=0)
+
+        print("mean", mean_grouped)
+
         advantages = rewards - mean_grouped
         
         if self.scale_rewards:
@@ -814,6 +863,7 @@ class GRPOTrainer(Trainer):
                      return_outputs: bool = False,
                      num_items_in_batch: int | None = None) -> torch.Tensor: 
         mode = "train" 
+        print('loss ', inputs)
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
@@ -823,6 +873,7 @@ class GRPOTrainer(Trainer):
         per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
 
         # Compute the loss
+        # EDITAR AQUI
         advantages = inputs["advantages"]
         # When using num_iterations == 1, old_per_token_logps == per_token_logps,
         # so we can skip it's computation (see _generate_and_score_completions) and use per_token_logps.detach() instead.

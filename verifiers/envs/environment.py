@@ -97,6 +97,11 @@ class Environment(ABC):
                        few_shot: List[Dict[str, Any]] | None = None,
                        question_key: str = "question",
                        answer_key: str = "answer") -> Dataset:
+
+         # skip if "prompt" already exists
+        
+        if "prompt" in dataset.column_names:
+            return dataset
         # Extract format_prompt as a standalone function to avoid capturing self
         def format_prompt_fn(prompt: str) -> List[Dict[str, Any]]:
             messages = []

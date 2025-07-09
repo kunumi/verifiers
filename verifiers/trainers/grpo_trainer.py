@@ -711,10 +711,14 @@ class GRPOTrainer(Trainer):
                 # Create rewards tensor and compute advantages using full batch
                 assert broadcast_data is not None  # After broadcast, all processes have data
 
-                # # Filtragem de rollouts
+                # Para logs
+                broadcast_data_old = broadcast_data.copy()
+                all_rewards_old = torch.tensor(broadcast_data['rewards'], device=self.accelerator.device)
+
+                # Filtragem de rollouts
                 rewards_tensor = torch.tensor(broadcast_data['rewards'], device=self.accelerator.device)
                 num_groups = rewards_tensor.numel() // self.num_generations
-                top_n = min(self.rollout_filter_ratio*num_groups, num_groups)
+                top_n = int(min(self.rollout_filter_ratio*num_groups, num_groups))
 
                 if top_n < num_groups:
                     group_stds = rewards_tensor.view(num_groups, self.num_generations).std(dim=1)
@@ -732,6 +736,8 @@ class GRPOTrainer(Trainer):
                         broadcast_data['prompts'] = _select(broadcast_data['prompts'], keep_mask_cpu)
                     if broadcast_data['completions']:
                         broadcast_data['completions'] = _select(broadcast_data['completions'], keep_mask_cpu)
+                    if broadcast_data['all_reward_dict']:
+                        broadcast_data['all_reward_dict'] = {k: _select(v, keep_mask_cpu) for k, v in broadcast_data['all_reward_dict'].items()}
             
 
                 batch_size = len(broadcast_data['prompt_ids'])
@@ -742,7 +748,6 @@ class GRPOTrainer(Trainer):
                 end      = min(start + per_proc, batch_size)
 
                 process_slice = slice(start, end)
-                print("inputs", len(inputs))
                 
 
                 all_rewards = torch.tensor(broadcast_data['rewards'], device=self.accelerator.device)
@@ -785,23 +790,23 @@ class GRPOTrainer(Trainer):
                 if self.accelerator.is_main_process:
                     self._log_reward_metrics_primary(
                         mode="train",
-                        all_reward_dict=broadcast_data['all_reward_dict'],
-                        all_rewards=all_rewards,
-                        generation_batch_size=len(all_rewards)
+                        all_reward_dict=broadcast_data_old['all_reward_dict'],
+                        all_rewards=all_rewards_old,
+                        generation_batch_size=len(all_rewards_old)
                     )
                     
                     self._log_textual_data_primary(
-                        all_prompts=broadcast_data['prompts'],
-                        all_completions=broadcast_data['completions'],
-                        all_reward_dict=broadcast_data['all_reward_dict']
+                        all_prompts=broadcast_data_old['prompts'],
+                        all_completions=broadcast_data_old['completions'],
+                        all_reward_dict=broadcast_data_old['all_reward_dict']
                     )
                     
                     # Log completion metrics using full batch data on CPU to save memory
                     self._log_completion_metrics_primary(
                         mode="train",
-                        all_completion_mask=broadcast_data['completion_mask'],
-                        all_completion_ids=broadcast_data['completion_ids'], 
-                        all_prompt_mask=broadcast_data['prompt_mask']
+                        all_completion_mask=broadcast_data_old['completion_mask'],
+                        all_completion_ids=broadcast_data_old['completion_ids'], 
+                        all_prompt_mask=broadcast_data_old['prompt_mask']
                     )
                 
                 # Concatenate all data for shuffling
@@ -817,13 +822,14 @@ class GRPOTrainer(Trainer):
                 
                 # Shuffle and split for gradient accumulation
                 full_batch = shuffle_tensor_dict(full_batch)
-                self._buffered_inputs = split_tensor_dict(full_batch, self.gradient_accumulation_steps)
+                self._buffered_inputs = split_tensor_dict(full_batch, min(len(full_batch['advantages']), self.gradient_accumulation_steps))
+                print("Buffer: ", self._buffered_inputs)
                 self.accelerator.wait_for_everyone()
             # Return appropriate slice from buffer
-            result = self._buffered_inputs[self._step % self.gradient_accumulation_steps]
+            buffer_idx = self._step % len(self._buffered_inputs)
+            result = self._buffered_inputs[buffer_idx]
             self._step += 1
             self.accelerator.wait_for_everyone()
-            print("result", result)
             return result
         except Exception:
             traceback.print_exc()
@@ -835,19 +841,15 @@ class GRPOTrainer(Trainer):
     ) -> torch.Tensor:
         """Compute advantages from rewards with normalization using full batch statistics."""
 
-        print(rewards)
-
         # Always use full batch statistics
         mean_grouped = rewards.view(-1, self.num_generations).mean(dim=1)
-        std_grouped = rewards.view(-1, self.num_generations).std(dim=1) # tamanho vai ser o numero de grupos (?), ai posso selecionar as que eu quero
+        std_grouped = rewards.view(-1, self.num_generations).std(dim=1) 
 
-        print("mean", mean_grouped)
         
         # Normalize the rewards to compute advantages
         mean_grouped = mean_grouped.repeat_interleave(self.num_generations, dim=0)
         std_grouped = std_grouped.repeat_interleave(self.num_generations, dim=0)
 
-        print("mean", mean_grouped)
 
         advantages = rewards - mean_grouped
         
@@ -863,7 +865,6 @@ class GRPOTrainer(Trainer):
                      return_outputs: bool = False,
                      num_items_in_batch: int | None = None) -> torch.Tensor: 
         mode = "train" 
-        print('loss ', inputs)
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]

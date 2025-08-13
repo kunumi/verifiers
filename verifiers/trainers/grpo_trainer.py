@@ -137,6 +137,7 @@ class GRPOTrainer(Trainer):
             self,
             model: PreTrainedModel,
             env: Environment,
+            env_response,
             args: GRPOConfig,
             processing_class: PreTrainedTokenizerBase,
             callbacks: Optional[list[TrainerCallback]] = None,
@@ -161,11 +162,14 @@ class GRPOTrainer(Trainer):
         if processing_class.pad_token is None: # type: ignore
             processing_class.pad_token = processing_class.eos_token # type: ignore
 
+        self.env_response = env_response
+
         # Training arguments
         self.per_device_train_batch_size = args.per_device_train_batch_size
         self.max_prompt_length = args.max_prompt_length
         self.max_completion_length = args.max_completion_length  # = |o_i| in the GRPO paper
         self.num_generations = args.num_generations  # = G in the GRPO paper
+        self.num_refinement_turns = args.num_refinement_turns
         self.max_concurrent = args.max_concurrent
         self.max_num_processes = args.max_num_processes
         self.temperature = args.temperature
@@ -193,6 +197,8 @@ class GRPOTrainer(Trainer):
         self.gradient_accumulation_steps = args.gradient_accumulation_steps
         self._step = 0
         self._buffered_inputs: Optional[List[Dict[str, Optional[torch.Tensor]]]] = None
+
+        self._next_refine_batch_id = args.max_steps + 1
 
         # Data 
         self.shuffle_dataset = args.shuffle_dataset 
@@ -687,19 +693,110 @@ class GRPOTrainer(Trainer):
                     
                     # Package raw data for broadcast (not tensors yet)
                     broadcast_data = {
-                        'prompt_ids': processed_results['prompt_ids'],
-                        'prompt_mask': processed_results['prompt_mask'],
-                        'completion_ids': processed_results['completion_ids'],
-                        'completion_mask': processed_results['completion_mask'],
-                        'rewards': processed_results['rewards'],
-                        'all_reward_dict': batch_result.all_reward_dict if hasattr(batch_result, 'all_reward_dict') else {'reward': processed_results['rewards']},
-                        'completions': batch_result.completions if hasattr(batch_result, 'completions') else [],
-                        'prompts': batch_result.prompts if hasattr(batch_result, 'prompts') else [],
+                        'prompt_ids': processed_results['prompt_ids'].copy(),
+                        'prompt_mask': processed_results['prompt_mask'].copy(),
+                        'completion_ids': processed_results['completion_ids'].copy(),
+                        'completion_mask': processed_results['completion_mask'].copy(),
+                        'rewards': processed_results['rewards'].copy(),
+                        'all_reward_dict': batch_result.all_reward_dict if hasattr(batch_result, 'all_reward_dict') else {'reward': processed_results['rewards'].copy()},
+                        'completions': batch_result.completions.copy() if hasattr(batch_result, 'completions') else [],
+                        'prompts': batch_result.prompts.copy() if hasattr(batch_result, 'prompts') else [],
                     }
+
+                    for i in range(self.num_refinement_turns):
+                        cur_batch_id = self._next_refine_batch_id
+                        self._next_refine_batch_id += 1
+
+                        all_prompts = []
+                        for s, p, c in zip(batch_result.state, batch_result.prompts, batch_result.completions):
+                            all_prompts.append([self.env_response(s, p, c)[0]])
+
+                        all_answers = [s['answer'] for s in batch_result.state]
+                        all_tasks = [s['task'] for s in batch_result.state]
+
+
+                        request = BatchRequest(
+                                batch_id=cur_batch_id,
+                                env_inputs={'prompt': all_prompts, 'answer': all_answers, 'task': all_tasks},
+                                processing_class=self.processing_class,
+                                mask_env_responses=self.mask_env_responses,
+                                max_completion_length=self.max_completion_length,
+                                mask_truncated_completions=self.mask_truncated_completions,
+                                max_concurrent=self.max_concurrent,
+                                device=self.accelerator.device,
+                                accelerator=self.accelerator,
+                                process_index=self.accelerator.process_index,
+                                num_processes=self.accelerator.num_processes,
+                                local_batch_size=len(all_prompts) // self.accelerator.num_processes,
+                            )
+                        
+                        self.async_generator.submit_batch(request)
+                        self.logger.info(f"Submitted batch {cur_batch_id} with {len(all_prompts)} prompts (num processes: {self.accelerator.num_processes})")
+
+                        batch_result = self.async_generator.get_batch(cur_batch_id)
+                        self.logger.info(f"Retrieved batch {cur_batch_id}.")
+                        processed_results = batch_result.processed_results
+
+                        # extending the broadcast data
+                        for key in ['prompt_ids', 'prompt_mask', 'completion_ids', 'completion_mask', 'rewards']:
+                            broadcast_data[key].extend(processed_results[key])
+
+                        broadcast_data['prompts'].extend(getattr(batch_result, 'prompts', []))
+                        broadcast_data['completions'].extend(getattr(batch_result, 'completions', []))
+
+                        new_reward_dict = getattr(batch_result, 'all_reward_dict')
+                        for k, v in new_reward_dict.items():
+                            broadcast_data['all_reward_dict'][k].extend(v)
+
+                    del processed_results
+                    del batch_result
+
+                    def _reorder(seq, n, m):
+                        # incoming layout: [t0s0, t1s0, …, tn-1s0, t0s1, t1s1, …]
+                        # outgoing layout: [t0s0, t0s1, …, t0sm-1, t1s0, t1s1, …]
+                        return [seq[s * n + t] for t in range(n) for s in range(m)]
+
+                    for key in ['prompt_ids', 'prompt_mask', 'completion_ids', 'completion_mask', 'rewards']:
+                        broadcast_data[key] = _reorder(broadcast_data[key], len(all_prompts), self.num_refinement_turns+1)
+
+                    if broadcast_data['prompts']:
+                        broadcast_data['prompts'] = _reorder(broadcast_data['prompts'], len(all_prompts), self.num_refinement_turns+1)
+
+                    if broadcast_data['completions']:
+                        broadcast_data['completions'] = _reorder(broadcast_data['completions'], len(all_prompts), self.num_refinement_turns+1)
+
+                    if broadcast_data['all_reward_dict']:
+                        for k, v in broadcast_data['all_reward_dict'].items():
+                            broadcast_data['all_reward_dict'][k] = _reorder(v, len(all_prompts), self.num_refinement_turns+1)
+
+                    print('Pre-pro rewards: ', broadcast_data['rewards'])
+
+                    def process_multistep_rewards(data):
+                        # for each trajectory
+                        end_rewards = []
+                        for i in range(len(all_prompts)):
+                            trajectory_prompts = data['prompts'][i*(self.num_refinement_turns+1):(i+1)*(self.num_refinement_turns+1)]
+                            trajectory_completions = data['completions'][i*(self.num_refinement_turns+1):(i+1)*(self.num_refinement_turns+1)]
+                            trajectory_rewards = data['rewards'][i*(self.num_refinement_turns+1):(i+1)*(self.num_refinement_turns+1)]
+                            # for each step
+                            for j in range(len(trajectory_rewards)):
+                                new_reward = sum(0.4**h * v for h, v in enumerate(trajectory_rewards[j:]))
+                                end_rewards.append(new_reward)
+
+                        return end_rewards
+
+                    broadcast_data['rewards'] = process_multistep_rewards(broadcast_data)
+
                 else:
                     broadcast_data = None
                 self.accelerator.wait_for_everyone()
 
+
+                # TODO: Check if necessary
+                next_batch_id_list = [self._next_batch_id if self.accelerator.is_main_process else 0]
+                broadcast_object_list(next_batch_id_list, from_process=0)
+                self._next_batch_id = next_batch_id_list[0]
+                self.accelerator.wait_for_everyone()
             
                 # Broadcast processed data
                 broadcast_list = [broadcast_data]
@@ -717,15 +814,15 @@ class GRPOTrainer(Trainer):
 
                 # Filtragem de rollouts
                 rewards_tensor = torch.tensor(broadcast_data['rewards'], device=self.accelerator.device)
-                num_groups = rewards_tensor.numel() // self.num_generations
+                num_groups = rewards_tensor.numel() // (self.num_generations * (self.num_refinement_turns+1))
                 top_n = int(min(self.rollout_filter_ratio*num_groups, num_groups))
 
                 if top_n < num_groups:
-                    group_stds = rewards_tensor.view(num_groups, self.num_generations).std(dim=1)
+                    group_stds = rewards_tensor.view(num_groups, (self.num_generations * (self.num_refinement_turns+1))).std(dim=1)
                     _, top_idx = torch.topk(group_stds, top_n)
                     keep_mask = torch.zeros(num_groups, dtype=torch.bool, device=rewards_tensor.device)
                     keep_mask[top_idx] = True
-                    keep_mask = keep_mask.repeat_interleave(self.num_generations)
+                    keep_mask = keep_mask.repeat_interleave((self.num_generations * (self.num_refinement_turns+1)))
                     keep_mask_cpu = keep_mask.cpu().tolist()
 
                     def _select(lst, mask): return [x for x, keep in zip(lst, mask) if keep]
@@ -740,14 +837,21 @@ class GRPOTrainer(Trainer):
                         broadcast_data['all_reward_dict'] = {k: _select(v, keep_mask_cpu) for k, v in broadcast_data['all_reward_dict'].items()}
             
 
-                batch_size = len(broadcast_data['prompt_ids'])
+                batch_size = len(broadcast_data['prompt_ids']) // self.accelerator.num_processes
+                print("Batch size: ", batch_size, len(broadcast_data['rewards']))
 
                 # distribute examples as evenly as possible
-                per_proc = (batch_size + self.accelerator.num_processes - 1) // self.accelerator.num_processes
-                start    = self.accelerator.process_index * per_proc
-                end      = min(start + per_proc, batch_size)
+                # per_proc = (batch_size + self.accelerator.num_processes - 1) // self.accelerator.num_processes
+                # start    = self.accelerator.process_index * per_proc
+                # end      = min(start + per_proc, batch_size)
 
-                process_slice = slice(start, end)
+                # process_slice = slice(start, end)
+
+                process_slice = slice(
+                    self.accelerator.process_index * batch_size,
+                    (self.accelerator.process_index + 1) * batch_size,
+                )
+
                 
 
                 all_rewards = torch.tensor(broadcast_data['rewards'], device=self.accelerator.device)
@@ -823,7 +927,7 @@ class GRPOTrainer(Trainer):
                 # Shuffle and split for gradient accumulation
                 full_batch = shuffle_tensor_dict(full_batch)
                 self._buffered_inputs = split_tensor_dict(full_batch, min(len(full_batch['advantages']), self.gradient_accumulation_steps))
-                print("Buffer: ", self._buffered_inputs)
+                print("Buffer: ")
                 self.accelerator.wait_for_everyone()
             # Return appropriate slice from buffer
             buffer_idx = self._step % len(self._buffered_inputs)
@@ -842,13 +946,13 @@ class GRPOTrainer(Trainer):
         """Compute advantages from rewards with normalization using full batch statistics."""
 
         # Always use full batch statistics
-        mean_grouped = rewards.view(-1, self.num_generations).mean(dim=1)
-        std_grouped = rewards.view(-1, self.num_generations).std(dim=1) 
+        mean_grouped = rewards.view(-1, (self.num_generations * (self.num_refinement_turns+1))).mean(dim=1)
+        std_grouped = rewards.view(-1, (self.num_generations * (self.num_refinement_turns+1))).std(dim=1) 
 
         
         # Normalize the rewards to compute advantages
-        mean_grouped = mean_grouped.repeat_interleave(self.num_generations, dim=0)
-        std_grouped = std_grouped.repeat_interleave(self.num_generations, dim=0)
+        mean_grouped = mean_grouped.repeat_interleave((self.num_generations * (self.num_refinement_turns+1)), dim=0)
+        std_grouped = std_grouped.repeat_interleave((self.num_generations * (self.num_refinement_turns+1)), dim=0)
 
 
         advantages = rewards - mean_grouped
@@ -1095,8 +1199,8 @@ class GRPOTrainer(Trainer):
         This handles reward statistics and per-reward-function metrics using the full batch data.
         """
         # Log reward statistics using full batch
-        mean_rewards = all_rewards.view(-1, self.num_generations).mean(dim=1)
-        std_rewards = all_rewards.view(-1, self.num_generations).std(dim=1)
+        mean_rewards = all_rewards.view(-1, (self.num_generations * (self.num_refinement_turns+1))).mean(dim=1)
+        std_rewards = all_rewards.view(-1, (self.num_generations * (self.num_refinement_turns+1))).std(dim=1)
         self._metrics[mode]["reward"].append(mean_rewards.mean().item())
         self._metrics[mode]["reward_std"].append(std_rewards.mean().item())
         

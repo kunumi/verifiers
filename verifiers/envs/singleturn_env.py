@@ -25,6 +25,8 @@ class SingleTurnEnv(Environment):
         """
         Returns completion (str or message list) and null state.
         """
+        task = kwargs.get('task', None)
+        state = {'answer': answer, 'task': task}
         completion = self.get_model_response(
             client=client,
             model=model,
@@ -33,6 +35,6 @@ class SingleTurnEnv(Environment):
             message_type=self.message_type
         )
         if self.message_type == 'chat': 
-            return [{'role': 'assistant', 'content': completion}], {}
-        return completion, {}
+            return [{'role': 'assistant', 'content': completion}], state
+        return completion, state
     

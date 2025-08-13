@@ -69,6 +69,12 @@ class GRPOConfig(TrainingArguments):
             "* gradient_accumulation_steps) must be evenly divisible by this value."
         },
     )
+    num_refinement_turns: int = field(
+        default=3,
+        metadata={
+            "help": "Number of refinment turns used for each rollout."
+        },
+    )
     max_completion_length: int = field(
         default=1024,
         metadata={"help": "Maximum length of the generated completion."},

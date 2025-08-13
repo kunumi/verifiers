@@ -11,6 +11,7 @@ import re
 
 from verifiers.parsers import XMLParser
 from verifiers.envs.multiturn_env import MultiTurnEnv
+from verifiers.envs.singleturn_env import SingleTurnEnv
 
 
 DEFAULT_SEARCH_PROMPT_TEMPLATE = """
@@ -207,7 +208,7 @@ class BinarySearchRubric(Rubric):
 
 
 
-class BinarySearchEnv(MultiTurnEnv):
+class BinarySearchEnv(SingleTurnEnv):
     def __init__(self, dataset, max_turns: int = 10, **kwargs):
 
         super().__init__(dataset=dataset["train"], eval_dataset=dataset['eval'], message_type='chat', **kwargs)

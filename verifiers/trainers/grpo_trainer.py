@@ -279,7 +279,7 @@ class GRPOTrainer(Trainer):
 
         # maxlen is set to the total number of forward passes per step. This value of `maxlen` ensures we log only the
         # final optimization step.
-        maxlen = self.accelerator.num_processes * args.per_device_train_batch_size * args.gradient_accumulation_steps
+        maxlen = self.accelerator.num_processes * args.per_device_train_batch_size * args.gradient_accumulation_steps * (self.num_refinement_turns + 1)
         self._textual_logs = {
             "prompt": deque(maxlen=maxlen),
             "completion": deque(maxlen=maxlen),
@@ -769,7 +769,6 @@ class GRPOTrainer(Trainer):
                         for k, v in broadcast_data['all_reward_dict'].items():
                             broadcast_data['all_reward_dict'][k] = _reorder(v, len(all_prompts), self.num_refinement_turns+1)
 
-                    print('Pre-pro rewards: ', broadcast_data['rewards'])
 
                     def process_multistep_rewards(data):
                         # for each trajectory
@@ -780,23 +779,19 @@ class GRPOTrainer(Trainer):
                             trajectory_rewards = data['rewards'][i*(self.num_refinement_turns+1):(i+1)*(self.num_refinement_turns+1)]
                             # for each step
                             for j in range(len(trajectory_rewards)):
-                                new_reward = sum(0.4**h * v for h, v in enumerate(trajectory_rewards[j:]))
+                                new_reward = sum(0.2**h * v for h, v in enumerate(trajectory_rewards[j:]))
                                 end_rewards.append(new_reward)
 
                         return end_rewards
 
                     broadcast_data['rewards'] = process_multistep_rewards(broadcast_data)
+                    broadcast_data['all_reward_dict']['reward_original'] = broadcast_data['all_reward_dict']['reward']
+                    broadcast_data['all_reward_dict']['reward'] = broadcast_data['rewards']
 
                 else:
                     broadcast_data = None
                 self.accelerator.wait_for_everyone()
 
-
-                # TODO: Check if necessary
-                next_batch_id_list = [self._next_batch_id if self.accelerator.is_main_process else 0]
-                broadcast_object_list(next_batch_id_list, from_process=0)
-                self._next_batch_id = next_batch_id_list[0]
-                self.accelerator.wait_for_everyone()
             
                 # Broadcast processed data
                 broadcast_list = [broadcast_data]
@@ -838,14 +833,6 @@ class GRPOTrainer(Trainer):
             
 
                 batch_size = len(broadcast_data['prompt_ids']) // self.accelerator.num_processes
-                print("Batch size: ", batch_size, len(broadcast_data['rewards']))
-
-                # distribute examples as evenly as possible
-                # per_proc = (batch_size + self.accelerator.num_processes - 1) // self.accelerator.num_processes
-                # start    = self.accelerator.process_index * per_proc
-                # end      = min(start + per_proc, batch_size)
-
-                # process_slice = slice(start, end)
 
                 process_slice = slice(
                     self.accelerator.process_index * batch_size,
@@ -927,7 +914,6 @@ class GRPOTrainer(Trainer):
                 # Shuffle and split for gradient accumulation
                 full_batch = shuffle_tensor_dict(full_batch)
                 self._buffered_inputs = split_tensor_dict(full_batch, min(len(full_batch['advantages']), self.gradient_accumulation_steps))
-                print("Buffer: ")
                 self.accelerator.wait_for_everyone()
             # Return appropriate slice from buffer
             buffer_idx = self._step % len(self._buffered_inputs)
@@ -978,7 +964,6 @@ class GRPOTrainer(Trainer):
         per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
 
         # Compute the loss
-        # EDITAR AQUI
         advantages = inputs["advantages"]
         # When using num_iterations == 1, old_per_token_logps == per_token_logps,
         # so we can skip it's computation (see _generate_and_score_completions) and use per_token_logps.detach() instead.
@@ -1200,19 +1185,26 @@ class GRPOTrainer(Trainer):
         """
         # Log reward statistics using full batch
         mean_rewards = all_rewards.view(-1, (self.num_generations * (self.num_refinement_turns+1))).mean(dim=1)
+
+        original_rewards = torch.tensor(all_reward_dict["reward_original"], device=all_rewards.device)
+        max_trajectory_rewards = original_rewards.view(-1, (self.num_refinement_turns+1)).max(dim=1).values # getting only the best reward of trajectory
+        mean_trajectory_rewards = max_trajectory_rewards.view(-1, self.num_generations).mean(dim=1)
+
         std_rewards = all_rewards.view(-1, (self.num_generations * (self.num_refinement_turns+1))).std(dim=1)
+
         self._metrics[mode]["reward"].append(mean_rewards.mean().item())
+        self._metrics[mode]["trajectory_max_reward"].append(mean_trajectory_rewards.mean().item())
         self._metrics[mode]["reward_std"].append(std_rewards.mean().item())
         
         # Log individual reward function scores as metrics
         for reward_key in all_reward_dict:
-            if reward_key != 'reward':  # Skip the consolidated reward
+            if reward_key not in ['reward', "reward_original"]:  # Skip the consolidated reward
                 reward_values = all_reward_dict[reward_key]
                 if isinstance(reward_values, list):
                     reward_tensor = torch.tensor(reward_values, device=all_rewards.device)
                 else:
                     reward_tensor = reward_values
-                mean_reward = reward_tensor.mean().item()
+                mean_reward = reward_tensor.float().mean().item()
                 self._metrics[mode][f"rewards/{reward_key}"].append(mean_reward)
 
     def _log_textual_data_primary(
